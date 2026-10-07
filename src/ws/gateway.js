@@ -1,33 +1,108 @@
+const jwt = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
+const config = require('../config');
+const { sendMessage } = require('../modules/messaging/messageService');
 
-const PING_INTERVAL_MS = 30000; // REQ-21
-const MAX_PAYLOAD_BYTES = 4096; // SRS 3.3 (4 KB frame limit)
+const PING_INTERVAL_MS = 30000;
+const MAX_PAYLOAD_BYTES = 4096;
 
-// WebSocket gateway skeleton. Real behaviour is built in later stories:
-//   CA-19  Origin check, auth event within 5 s, close 4401 on failure (REQ-6)
-//   CA-22  message:send / message:new routing (REQ-9)
-//   CA-35  ping/pong heartbeat, offline within 40 s (REQ-21)
-function attachGateway(server, { allowedOrigin }) {
+function send(socket, type, payload) {
+  if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type, payload }));
+}
+
+// TODO(CA-19): replace with the team's real token check once it is merged.
+function defaultAuthenticate(token) {
+  const decoded = jwt.verify(token, config.jwtSecret);
+  return String(decoded.sub || decoded.userId || decoded.id);
+}
+
+function attachGateway(server, { allowedOrigin, authenticate = defaultAuthenticate }) {
   const wss = new WebSocketServer({
     server,
     path: '/ws',
     maxPayload: MAX_PAYLOAD_BYTES,
-    verifyClient: ({ origin }) => !origin || origin === allowedOrigin, // SEC-6 (basic)
+    verifyClient: ({ origin }) => !origin || origin === allowedOrigin,
   });
+
+  // userId -> set of that user's open sockets (CA-22)
+  const online = new Map();
+
+  function register(socket, userId) {
+    socket.userId = userId;
+    if (!online.has(userId)) online.set(userId, new Set());
+    online.get(userId).add(socket);
+  }
+
+  function unregister(socket) {
+    const sockets = online.get(socket.userId);
+    if (!sockets) return;
+    sockets.delete(socket);
+    if (sockets.size === 0) online.delete(socket.userId);
+  }
+
+  async function handleSend(socket, payload = {}) {
+    const { conversationId, content, clientMsgId } = payload;
+    try {
+      // Persisted first. Nothing below runs if the save fails.
+      const { message, recipientIds } = await sendMessage({
+        senderId: socket.userId,
+        conversationId,
+        content,
+        clientMsgId,
+      });
+
+      send(socket, 'message:status', {
+        clientMsgId,
+        messageId: String(message._id),
+        status: 'SENT',
+      });
+
+      recipientIds.forEach((id) => {
+        (online.get(id) || []).forEach((s) => send(s, 'message:new', { message }));
+      });
+    } catch (err) {
+      const known = Boolean(err.status && err.status < 500);
+      send(socket, 'error', {
+        code: known ? err.code : 'INTERNAL_ERROR',
+        message: known ? err.message : 'Message could not be saved, please try again',
+        clientMsgId,
+      });
+    }
+  }
 
   wss.on('connection', (socket) => {
     socket.isAlive = true;
-    socket.on('pong', () => { socket.isAlive = true; });
+    socket.on('pong', () => {
+      socket.isAlive = true;
+    });
+    socket.on('close', () => unregister(socket));
 
-    socket.on('message', (raw) => {
+    socket.on('message', async (raw) => {
       let msg;
       try {
         msg = JSON.parse(raw.toString());
       } catch {
-        return socket.send(JSON.stringify({ type: 'error', payload: { code: 'VALIDATION_ERROR', message: 'Invalid JSON' } }));
+        return send(socket, 'error', { code: 'VALIDATION_ERROR', message: 'Invalid JSON' });
       }
-      // TODO: dispatch msg.type (auth, message:send, typing, ...) to modules
-      socket.send(JSON.stringify({ type: 'error', payload: { code: 'VALIDATION_ERROR', message: `Unsupported event: ${msg.type}` } }));
+
+      if (msg.type === 'auth') {
+        try {
+          register(socket, await authenticate(msg.payload && msg.payload.token));
+          return send(socket, 'auth:ok', { userId: socket.userId });
+        } catch {
+          send(socket, 'error', { code: 'AUTH_FAILED', message: 'Authentication failed' });
+          return socket.close(4401, 'AUTH_FAILED');
+        }
+      }
+
+      if (!socket.userId) {
+        send(socket, 'error', { code: 'AUTH_FAILED', message: 'Authenticate first' });
+        return socket.close(4401, 'AUTH_FAILED');
+      }
+
+      if (msg.type === 'message:send') return handleSend(socket, msg.payload);
+
+      return send(socket, 'error', { code: 'VALIDATION_ERROR', message: `Unsupported event: ${msg.type}` });
     });
   });
 

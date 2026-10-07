@@ -13,8 +13,8 @@ function createApp() {
     res.json({ status: 'ok', uptime: process.uptime(), db: dbState() });
   });
 
-  // Private conversation routes
-app.use('/api/conversations', require('./modules/messaging/routes'));
+  // Conversations (CA-21)
+  app.use('/api/conversations', require('./modules/messaging/routes'));
   app.use(notFound);
   app.use(errorHandler);
   return app;

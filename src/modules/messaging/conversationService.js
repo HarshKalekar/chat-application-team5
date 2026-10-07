@@ -1,65 +1,32 @@
 const Conversation = require('../../models/Conversation');
 const User = require('../../models/User');
+const { AppError } = require('../../middleware/errorHandler');
 
-/**
- * Find an existing private conversation between two users,
- * or create one if it does not exist.
- */
+// Find the private conversation between two users, or create it.
 async function getOrCreatePrivateConversation(userId, otherUserId) {
   if (!userId || !otherUserId) {
-    const error = new Error('Both user IDs are required.');
-    error.statusCode = 400;
-    throw error;
+    throw new AppError(400, 'VALIDATION_ERROR', 'Both user IDs are required.');
   }
-
   if (String(userId) === String(otherUserId)) {
-    const error = new Error('A private conversation requires two different users.');
-    error.statusCode = 400;
-    throw error;
+    throw new AppError(400, 'VALIDATION_ERROR', 'A private conversation needs two different users.');
   }
 
-  const [user, otherUser] = await Promise.all([
-    User.findById(userId),
-    User.findById(otherUserId),
-  ]);
-
+  const [user, otherUser] = await Promise.all([User.findById(userId), User.findById(otherUserId)]);
   if (!user || !otherUser) {
-    const error = new Error('One or both users were not found.');
-    error.statusCode = 404;
+    throw new AppError(404, 'NOT_FOUND', 'One or both users were not found.');
+  }
+
+  const participantsKey = Conversation.buildParticipantsKey([user._id, otherUser._id]);
+  const existing = await Conversation.findOne({ participantsKey });
+  if (existing) return existing;
+
+  try {
+    return await Conversation.create({ type: 'private', participants: [user._id, otherUser._id] });
+  } catch (error) {
+    // Two requests raced: the unique index rejected ours, so return the winner.
+    if (error.code === 11000) return Conversation.findOne({ participantsKey });
     throw error;
   }
-
-  const participants = [user._id, otherUser._id];
-
-  let conversation = await Conversation.findOne({
-    type: 'private',
-    participants: { $all: participants, $size: 2 },
-  });
-
-  if (!conversation) {
-    try {
-      conversation = await Conversation.create({
-        type: 'private',
-        participants,
-      });
-    } catch (error) {
-      // If another request created it simultaneously, reuse it.
-      if (error.code !== 11000) {
-        throw error;
-      }
-
-      conversation = await Conversation.findOne({
-        type: 'private',
-        participants: { $all: participants, $size: 2 },
-      });
-
-      if (!conversation) {
-        throw error;
-      }
-    }
-  }
-
-  return conversation;
 }
 
 module.exports = { getOrCreatePrivateConversation };

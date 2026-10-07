@@ -2,17 +2,8 @@ const mongoose = require('mongoose');
 
 const messageSchema = new mongoose.Schema(
   {
-    conversation: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Conversation',
-      required: true,
-      index: true,
-    },
-    sender: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-    },
+    conversation: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
+    sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     content: {
       type: String,
       required: true,
@@ -23,10 +14,10 @@ const messageSchema = new mongoose.Schema(
         message: 'Message content cannot be blank.',
       },
     },
+    status: { type: String, enum: ['SENT', 'DELIVERED', 'READ'], default: 'SENT' },
+    clientMsgId: { type: String },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
 messageSchema.index({ conversation: 1, createdAt: 1 });
